@@ -512,6 +512,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._make_scope_section())
         lay.addWidget(self._make_score_row())
         lay.addWidget(self._make_metrics_section())
+        lay.addWidget(self._make_inline_freq_response())
         return w
 
     def _make_controls(self) -> QFrame:
@@ -704,6 +705,31 @@ class MainWindow(QMainWindow):
         for c in (self._card_clarity, self._card_distortion,
                   self._card_noise, self._card_balance):
             lay.addWidget(c)
+        return grp
+
+    def _make_inline_freq_response(self) -> QGroupBox:
+        """Frequency-response chart shown on the main Test tab after a test completes."""
+        grp = QGroupBox("Frequency Response  (20 Hz – 20 kHz)")
+        grp.setStyleSheet(self._grp_style())
+        lay = QVBoxLayout(grp)
+        lay.setContentsMargins(5, 5, 5, 5)
+
+        self._inline_fr_fig    = Figure(figsize=(8, 2.2), facecolor=C["panel"])
+        self._inline_fr_ax     = self._inline_fr_fig.add_subplot(111)
+        self._style_ax(self._inline_fr_ax, "Frequency (Hz)", "Response (dB)", log_x=True)
+        self._inline_fr_canvas = FigureCanvas(self._inline_fr_fig)
+        self._inline_fr_canvas.setStyleSheet(f"background:{C['panel']};")
+        self._inline_fr_canvas.setFixedHeight(180)
+        lay.addWidget(self._inline_fr_canvas)
+
+        placeholder = QLabel("Run a test to see the frequency response here.")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet(f"color:{C['muted']};font-size:12px;border:none;")
+        self._inline_fr_placeholder = placeholder
+        lay.addWidget(placeholder)
+
+        grp.hide()           # hidden until first test result
+        self._inline_fr_grp = grp
         return grp
 
     # ── Results tab ───────────────────────────────────────────────────────────
@@ -1017,31 +1043,163 @@ class MainWindow(QMainWindow):
 
     def _build_recommendations(self, scores: dict) -> list[str]:
         recs = []
-        if scores.get("sinad", 0) < 60:
-            recs.append("Clarity is low — check for ground loops, keep cables away from power supplies, "
-                        "and try balanced connections if possible.")
-        if scores.get("thd", 0) < 60:
-            recs.append("Distortion is high — reduce input gain to avoid ADC saturation, "
-                        "or check source device for clipping.")
-        if scores.get("noise", 0) < 60:
-            recs.append("Noise floor is elevated — ensure a clean power supply, use high-quality cables, "
-                        "and ground the interface properly.")
-        if scores.get("flatness", 0) < 60:
-            recs.append("Frequency response is uneven — check EQ settings are flat, inspect cable quality "
-                        "at both low and high frequencies.")
-        if scores.get("is_stereo") and scores.get("channel_summary"):
-            ch = scores["channel_summary"]
+        noise_db  = scores.get("raw_noise_db", -90.0)
+        sinad_db  = scores.get("raw_sinad",    60.0)
+        thd_db    = scores.get("raw_thd_db",   -40.0)
+        noise_s   = scores.get("noise",        50.0)
+        sinad_s   = scores.get("sinad",        50.0)
+        thd_s     = scores.get("thd",          50.0)
+        flat_s    = scores.get("flatness",     50.0)
+        final     = scores.get("final",        50.0)
+        is_stereo = scores.get("is_stereo",    False)
+        baseline  = self.baseline
+
+        # ── 1. No calibration reminder ─────────────────────────────────────────
+        if not baseline:
+            recs.append(
+                "⚙  No calibration found. Run 'Calibrate (Loopback)' with a loopback cable "
+                "connected at HIGH gain to establish your interface's baseline. This improves "
+                "scoring accuracy significantly."
+            )
+
+        # ── 2. Gain staging — the #1 cause of a high noise floor ──────────────
+        if noise_db > -80.0:
+            recs.append(
+                f"🔊  Noise floor is {noise_db:.1f} dBFS — this is the most common issue and is "
+                "almost always caused by gain staging, NOT the cable type. Even a perfect "
+                "balanced cable can't overcome insufficient gain. Make sure your interface's "
+                "INPUT GAIN knob is turned up before testing so the signal is well above "
+                "the noise floor. A rule of thumb: peaks should reach −12 dBFS or higher."
+            )
+
+        # ── 3. Recalibrate at correct gain level ──────────────────────────────
+        if noise_db > -80.0 and baseline:
+            recs.append(
+                "🔁  If you recently changed your gain setting, recalibrate. Calibration "
+                "captures the noise floor at the gain level it was set when you calibrated. "
+                "If your test gain is different, the comparison will be inaccurate. "
+                "Match your gain exactly, or recalibrate at the gain you plan to use for testing."
+            )
+
+        # ── 4. Ground loop / hum (low-frequency noise) ────────────────────────
+        tone_scores = scores.get("tone_scores", [])
+        low_freq_poor = any(
+            ts.get("freq", 0) <= 100 and ts.get("score", 100) < 60
+            for ts in tone_scores
+        )
+        if low_freq_poor or (sinad_s < 60 and noise_db > -70.0):
+            recs.append(
+                "🔌  Low-frequency noise detected. This usually indicates a ground loop — "
+                "common when mixing gear from different power circuits. Try plugging all "
+                "equipment into the same power strip/board. A DI box or ground-lift adapter "
+                "between the CDJ and interface can eliminate hum without affecting audio quality."
+            )
+
+        # ── 5. High-frequency rolloff ─────────────────────────────────────────
+        high_freq_poor = any(
+            ts.get("freq", 0) >= 5000 and ts.get("score", 100) < 55
+            for ts in tone_scores
+        )
+        if high_freq_poor:
+            recs.append(
+                "📉  High-frequency performance drops above 5 kHz. This is expected in longer "
+                "unbalanced cable runs (capacitance causes treble rolloff above ~10 m). "
+                "If using balanced XLR cables under 10 m this may indicate your CDJ or "
+                "player has a built-in high-frequency limiter, or EQ has been applied. "
+                "Check that EQ/ISOLATOR knobs on the CDJ and mixer are centred/flat."
+            )
+
+        # ── 6. Clarity / SINAD low ────────────────────────────────────────────
+        if sinad_s < 60:
+            recs.append(
+                f"📻  Clarity (SINAD) is {sinad_db:.1f} dB — signal quality is below average. "
+                "Common causes: (1) gain too low so noise dominates, "
+                "(2) USB power supply noise coupling into the interface (try a different USB port "
+                "or a powered USB hub), (3) WiFi/Bluetooth interference — disable nearby wireless "
+                "devices when testing, (4) ground loop (see above)."
+            )
+
+        # ── 7. THD / distortion ───────────────────────────────────────────────
+        if thd_s < 60:
+            recs.append(
+                f"📊  Distortion (THD) is {thd_db:.1f} dB — higher than expected. "
+                "Main causes: (1) input gain is too high causing ADC saturation — reduce "
+                "until ⚠ CLIP disappears from the level meter, "
+                "(2) source device (CDJ/player) is itself clipping — check its output level, "
+                "(3) cables with loose/dirty connectors can introduce harmonic distortion."
+            )
+
+        # ── 8. Frequency balance / EQ ─────────────────────────────────────────
+        if flat_s < 60:
+            recs.append(
+                "🎛  Frequency balance is uneven. Check: (1) EQ on your CDJ or mixer is "
+                "completely flat/centred — even small boosts heavily affect the sweep test, "
+                "(2) isolator knobs are at 12 o'clock, (3) no DSP effects (reverb, echo, "
+                "filters) are active on the channel. For best results, connect your "
+                "source directly to the interface, bypassing any mixer."
+            )
+
+        # ── 9. USB noise ──────────────────────────────────────────────────────
+        if noise_db > -85.0 and sinad_s < 70:
+            recs.append(
+                "🖥  USB noise can degrade audio interfaces significantly. Try: "
+                "(1) connect the interface to a rear USB port on the PC/laptop (they often "
+                "have cleaner power), (2) use a powered USB hub with its own supply, "
+                "(3) avoid USB3 ports (the 5 GHz switching can couple into audio), "
+                "(4) ensure no USB hard drives or high-draw devices share the same USB hub."
+            )
+
+        # ── 10. Stereo imbalance ──────────────────────────────────────────────
+        if is_stereo and scores.get("channel_summary"):
+            ch   = scores["channel_summary"]
             diff = abs(ch.get("L_score", 0) - ch.get("R_score", 0))
-            if diff > 5:
+            if diff >= 10:
                 winner = ch.get("winner", "=")
                 worse  = "Right" if winner == "L" else "Left"
-                recs.append(f"{worse} channel is underperforming — inspect cable connections, "
-                            "swap L/R inputs to isolate whether it's the cable or the interface channel.")
-        if not recs:
-            recs.append("All measurements are within acceptable ranges. "
-                        "Your audio path is performing well.")
-        if scores.get("final", 0) >= 90:
-            recs.append("Outstanding result! Your setup is performing at a professional level.")
+                better = "Left" if winner == "L" else "Right"
+                recs.append(
+                    f"↔  {worse} channel scores {diff:.0f} points below {better}. "
+                    "Swap the cables on your interface inputs to determine if the problem "
+                    "follows the cable (cable issue) or stays on the same input (interface "
+                    "channel issue). A difference > 3 dB in noise or SINAD between channels "
+                    "warrants replacing the cable or cleaning the jack contacts."
+                )
+            elif diff >= 4:
+                recs.append(
+                    f"↔  Minor channel imbalance ({diff:.0f} pts). This is often due to "
+                    "slightly different cable lengths, or one jack being slightly worn. "
+                    "Check both connectors are fully seated."
+                )
+
+        # ── 11. Balanced cable note ───────────────────────────────────────────
+        if noise_db > -75.0:
+            recs.append(
+                "💡  Note on balanced cables: balanced (XLR/TRS) connections reduce "
+                "electromagnetic interference but they cannot fix a noise floor caused by "
+                "insufficient gain staging or USB interference. If you're already using "
+                "balanced cables and still seeing high noise, focus on gain level and USB "
+                "power quality first — those have far more impact on measured noise floor."
+            )
+
+        # ── 12. Excellent result ──────────────────────────────────────────────
+        if final >= 90:
+            recs.append(
+                "🏆  Outstanding result! Your audio path is performing at a professional "
+                "level. SINAD, THD, noise floor, and frequency balance are all excellent. "
+                "This setup is ready for recording and broadcast."
+            )
+        elif final >= 75 and not recs:
+            recs.append(
+                "✅  Good result overall. Minor improvements may be possible through "
+                "optimal gain staging and USB power quality, but your setup is performing "
+                "well for live and studio use."
+            )
+        elif not recs:
+            recs.append(
+                "All measurements are within acceptable ranges for this signal chain. "
+                "Run with calibration enabled for more accurate relative scoring."
+            )
+
         return recs
 
     # ── Advanced tab ──────────────────────────────────────────────────────────
@@ -1166,26 +1324,83 @@ class MainWindow(QMainWindow):
         self._on_status("Stopped")
 
     def _on_calibrate(self) -> None:
-        dlg = QMessageBox(self)
-        dlg.setWindowTitle("Calibrate — Loopback")
-        dlg.setIcon(QMessageBox.Icon.Information)
-        dlg.setText(
-            "⚠  IMPORTANT: Set your input gain as HIGH as possible\n"
-            "   WITHOUT clipping BEFORE you click OK.\n\n"
-            "   Watch the oscilloscope — if the waveform clips at ±1,\n"
-            "   reduce the gain slightly until the peaks are just below clipping.\n\n"
-            "Connect your output directly to your input (loopback)\n"
-            "then click OK to begin calibration."
-        )
-        dlg.setStandardButtons(
-            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
-        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("⚙  Calibrate — Loopback Setup")
+        dlg.setMinimumWidth(540)
         dlg.setStyleSheet(
-            f"QMessageBox{{background:{C['panel']};color:{C['text']};}}"
+            f"QDialog{{background:{C['panel']};color:{C['text']};}}"
+            f"QLabel{{color:{C['text']};font-size:11px;background:transparent;}}"
             f"QPushButton{{background:{C['accent2']};color:white;padding:6px 14px;"
-            f"border-radius:4px;font-weight:bold;}}"
+            f"border-radius:4px;font-weight:bold;font-size:12px;}}"
         )
-        if dlg.exec() != QMessageBox.StandardButton.Ok:
+        dlg_lay = QVBoxLayout(dlg)
+        dlg_lay.setContentsMargins(20, 16, 20, 16)
+        dlg_lay.setSpacing(10)
+
+        # Warning banner
+        warn = QLabel("⚠  GAIN CALIBRATION — READ BEFORE PROCEEDING")
+        warn.setStyleSheet(
+            f"background:{C['accent']};color:white;font-size:13px;"
+            f"font-weight:bold;padding:8px 12px;border-radius:6px;"
+        )
+        warn.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dlg_lay.addWidget(warn)
+
+        steps_txt = (
+            "<ol style='margin:0;padding-left:20px;line-height:1.8;'>"
+            f"<li><b style='color:{C['green']};font-size:12px;'>Connect loopback</b>"
+            " — run a cable from your interface's <b>OUTPUT</b> back into its <b>INPUT</b>.</li>"
+
+            f"<li><b style='color:{C['green']};font-size:12px;'>Watch the oscilloscope above</b>"
+            " — the green waveform shows your live input level.</li>"
+
+            f"<li><b style='color:{C['yellow']};font-size:12px;'>Turn your INPUT GAIN UP</b>"
+            " — use the hardware gain knob on your interface.  Turn it <b>HIGH</b>."
+            " You want the oscilloscope waveform to fill most of the window."
+            " The level meter should reach <b>GREEN or YELLOW</b>.</li>"
+
+            f"<li><b style='color:{C['orange']};font-size:12px;'>Avoid clipping!</b>"
+            " If you see <b style='color:{C['red']};'>⚠ CLIP</b> in the level meter,"
+            " or the waveform flatlines at the top/bottom, reduce gain slightly"
+            " until clipping disappears.</li>"
+
+            f"<li><b style='color:{C['cyan']};font-size:12px;'>Click OK</b>"
+            " — calibration will play the full test signal (~32 s) and record"
+            " the loopback as your baseline.  Keep the cable connected throughout.</li>"
+            "</ol>"
+        )
+        steps_lbl = QLabel(steps_txt)
+        steps_lbl.setWordWrap(True)
+        steps_lbl.setTextFormat(Qt.TextFormat.RichText)
+        steps_lbl.setStyleSheet(f"color:{C['text']};font-size:11px;background:transparent;")
+        dlg_lay.addWidget(steps_lbl)
+
+        tip = QLabel(
+            "💡  Tip: Calibration saves your interface's own noise & distortion floor."
+            "  Tests will subtract this baseline so only the device-under-test is measured."
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet(
+            f"color:{C['cyan']};font-size:10px;"
+            f"background:{C['accent2']};border-radius:4px;padding:6px 10px;"
+        )
+        dlg_lay.addWidget(tip)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("▶  Start Calibration")
+        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancel")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        btns.setStyleSheet(
+            f"QPushButton{{background:{C['accent2']};color:white;padding:6px 16px;"
+            f"border-radius:4px;font-weight:bold;font-size:12px;}}"
+            f"QPushButton[text='▶  Start Calibration']{{background:{C['accent']};}}"
+        )
+        dlg_lay.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         if self.reference_audio is None:
@@ -1256,28 +1471,43 @@ class MainWindow(QMainWindow):
         f = scores.get("flatness", 0.0)
         self._card_balance.set_score(f, scoring.get_metric_description("flatness", f))
 
-        # Freq response plots
+        # ── Freq response — update BOTH the inline (Test tab) and Advanced tab plots ──
         freqs = scores.get("freq_response_freqs")
         resp  = scores.get("freq_response_db")
+        is_st = scores.get("is_stereo", False)
+
+        def _draw_fr(ax, fig, canvas):
+            ax.clear()
+            self._style_ax(ax, "Frequency (Hz)", "Response (dB)", log_x=True)
+            if freqs is not None and resp is not None:
+                ax.plot(freqs, resp, color=C["accent"], lw=1.0, alpha=0.9, label="Avg")
+                if is_st:
+                    rL = scores.get("freq_response_db_L")
+                    rR = scores.get("freq_response_db_R")
+                    if rL is not None:
+                        ax.plot(freqs, rL, color=C["cyan"], lw=0.8, alpha=0.7,
+                                ls="--", label="L")
+                    if rR is not None:
+                        ax.plot(freqs, rR, color=C["purple"], lw=0.8, alpha=0.7,
+                                ls="--", label="R")
+                    ax.legend(facecolor=C["panel"], edgecolor=C["border"],
+                              labelcolor=C["text"], fontsize=8)
+                ax.axhline(0, color=C["muted"], lw=0.5, ls="--")
+                ax.set_ylim(-30, 30)
+                fig.tight_layout(pad=0.4)
+                canvas.draw()
+
+        _draw_fr(self._fr_ax,        self._fr_fig,        self._fr_canvas)
+        _draw_fr(self._inline_fr_ax, self._inline_fr_fig, self._inline_fr_canvas)
+
+        # Show/hide the inline chart placeholder vs plot
         if freqs is not None and resp is not None:
-            self._fr_ax.clear()
-            self._style_ax(self._fr_ax, "Frequency (Hz)", "Response (dB)", log_x=True)
-            self._fr_ax.plot(freqs, resp, color=C["accent"], lw=1.0, alpha=0.9, label="Avg")
-            if scores.get("is_stereo"):
-                rL = scores.get("freq_response_db_L")
-                rR = scores.get("freq_response_db_R")
-                if rL is not None:
-                    self._fr_ax.plot(freqs, rL, color=C["cyan"], lw=0.8,
-                                     alpha=0.7, ls="--", label="L")
-                if rR is not None:
-                    self._fr_ax.plot(freqs, rR, color=C["purple"], lw=0.8,
-                                     alpha=0.7, ls="--", label="R")
-                self._fr_ax.legend(facecolor=C["panel"], edgecolor=C["border"],
-                                   labelcolor=C["text"], fontsize=8)
-            self._fr_ax.axhline(0, color=C["muted"], lw=0.5, ls="--")
-            self._fr_ax.set_ylim(-30, 30)
-            self._fr_fig.tight_layout(pad=0.4)
-            self._fr_canvas.draw()
+            self._inline_fr_placeholder.hide()
+            self._inline_fr_canvas.show()
+        else:
+            self._inline_fr_placeholder.show()
+            self._inline_fr_canvas.hide()
+        self._inline_fr_grp.show()
 
         # Populate Results tab and switch to it
         self._populate_results(scores)

@@ -12,7 +12,7 @@ was scoring 0 instead of 100.  Now: lower dBFS = quieter = higher score.
 
 Scoring ranges
 --------------
-  SINAD  : 50 dB → 0,  110 dB → 100   (range chosen for pro & consumer gear)
+  SINAD  : 40 dB → 0,  100 dB → 100   (range chosen for pro & consumer gear)
   THD    : −40 dB → 0, −100 dB → 100  (log scale)
   Noise  : −40 dBFS → 0, −120 dBFS → 100  (FIXED: quieter = better)
   Flatness: σ = 10 → 0, σ = 0 → 100
@@ -32,8 +32,8 @@ import numpy as np
 # ── Individual metric scorers ─────────────────────────────────────────────────
 
 def score_sinad(sinad: float) -> float:
-    """50 dB → 0,  110 dB → 100."""
-    return float(np.clip((sinad - 50.0) / 60.0 * 100.0, 0.0, 100.0))
+    """40 dB → 0,  100 dB → 100.  (Widened range so real-world CDJ chains score fairly.)"""
+    return float(np.clip((sinad - 40.0) / 60.0 * 100.0, 0.0, 100.0))
 
 
 def score_thd(thd: float) -> float:
@@ -157,10 +157,13 @@ def compute_all_scores(measurements: dict,
     fr_db    = measurements.get("freq_response_db")
 
     # Baseline correction
+    # NOTE: SINAD correction has been intentionally removed.
+    # The formula (sinad - base_sinad + 80) could produce values like 124 dB
+    # when the loopback baseline is low (e.g. 29 dB) — wildly unrealistic.
+    # THD correction is kept: subtracting baseline THD removes the interface's
+    # own harmonic fingerprint so you're measuring the device under test.
     if baseline:
-        base_sinad = float(baseline.get("baseline_sinad", 80.0))
-        base_thd   = float(baseline.get("baseline_thd",   0.001))
-        sinad    = sinad  - base_sinad + 80.0
+        base_thd = float(baseline.get("baseline_thd", 0.001))
         thd      = max(thd - base_thd, 1e-12)
 
     scores: dict = {
