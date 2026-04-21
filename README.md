@@ -1,1 +1,4 @@
-Unzip all files into the same folder, run a termainal from taht folder and run: pip install -r requirements.txt and then: run main.py 
+Unzip all files into the same folder, open a termainal from withnin that folder and run: 
+pip install -r requirements.txt 
+python main.py
+
