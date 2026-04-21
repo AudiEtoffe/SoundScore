@@ -6,6 +6,7 @@ To install:
 Unzip all files into the same folder, open a terminal from within that folder and run: 
 
 pip install -r requirements.txt 
+
 python main.py
  
 
